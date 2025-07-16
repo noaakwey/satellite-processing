@@ -13,13 +13,7 @@
 
 ## Установка и настройка
 
-### Шаг 1: Сохранение библиотеки в GEE
-1. Создайте новый репозиторий в Code Editor GEE
-2. Назовите его `satellite-processing`
-3. Скопируйте код библиотеки и сохраните как `satellite-processing.js`
-4. Сделайте репозиторий публичным или приватным по необходимости
-
-### Шаг 2: Импорт в проект
+### Шаг 1: Импорт в проект
 ```javascript
 var satLib = require('users/ortho/satellite-processing:satellite-processing');
 var SatelliteProcessor = satLib.SatelliteProcessor;
