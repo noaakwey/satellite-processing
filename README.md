@@ -21,7 +21,7 @@
 
 ### Шаг 2: Импорт в проект
 ```javascript
-var satLib = require('users/YOUR_USERNAME/satellite-processing:satellite-processing');
+var satLib = require('users/ortho/satellite-processing:satellite-processing');
 var SatelliteProcessor = satLib.SatelliteProcessor;
 ```
 
