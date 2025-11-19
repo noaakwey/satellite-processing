@@ -1,0 +1,367 @@
+/**
+ * ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ БИБЛИОТЕКИ SatelliteProcessor
+ * Автор: А.М. Гафуров
+ */
+// Импорт библиотеки (замените путь на свой)
+var satLib = require('users/ortho/satellite-processing:satellite-processing');
+var SatelliteProcessor = satLib.SatelliteProcessor;
+/////////////////////////////////////
+// ПРИМЕР 1: Базовое использование Sentinel-2
+/////////////////////////////////////
+// Определяем параметры
+var roi = ee.Geometry.Polygon([/* ваши координаты */]);
+var startDate = '2020-01-01';
+var endDate = '2024-12-31';
+// Получаем чистую коллекцию
+var sentinel2Collection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  startDate,
+  endDate
+);
+// Добавляем индексы
+var s2WithIndices = sentinel2Collection.map(
+  SatelliteProcessor.addIndices.sentinel2Vegetation
+);
+// Создаем медианный композит
+var s2Median = SatelliteProcessor.composites.median(s2WithIndices);
+// Визуализация
+Map.addLayer(s2Median, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, 'S2 RGB');
+Map.addLayer(s2Median.select('NDVI'), {min: 0, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI');
+/////////////////////////////////////
+// ПРИМЕР 2: Landsat 8/9 с дополнительными опциями
+/////////////////////////////////////
+// Загружаем классификацию
+var classificationMask = ee.Image('projects/your-project/assets/classification');
+// Параметры с дополнительными опциями
+var options = {
+  months: [5, 9],  // только май-сентябрь
+  ndviThreshold: 0.2,  // исключить пиксели с NDVI > 0.2
+  classificationMask: classificationMask,
+  classesToExclude: [1, 2]  // исключить классы 1 (вода) и 2 (лес)
+};
+// Получаем чистую коллекцию
+var landsat89Collection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT89,
+  roi,
+  '2020-01-01',
+  '2025-01-01',
+  options
+);
+// Добавляем вегетационные индексы
+var l89WithIndices = landsat89Collection.map(
+  SatelliteProcessor.addIndices.landsat89Vegetation
+);
+// Создаем статистики для NDVI
+var ndviStats = SatelliteProcessor.composites.statistics(l89WithIndices, 'NDVI');
+// Экспорт
+Export.image.toDrive({
+  image: ndviStats,
+  description: 'NDVI_Statistics_L89',
+  region: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+/////////////////////////////////////
+// ПРИМЕР 3: Использование индексов() - новая функциональность
+/////////////////////////////////////
+// Вариант 1: Получить коллекцию со всеми поддерживаемыми индексами
+var collectionAllIndices = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    months: [5, 9],
+    indices: SatelliteProcessor.supportedIndices.sentinel2.all  // все индексы
+  }
+);
+// Вариант 2: Только конкретные индексы
+var collectionSpecificIndices = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    indices: ['NDVI', 'NDRE', 'EVI2', 'NDMI', 'NDWI']  // только эти индексы
+  }
+);
+// Вариант 3: Только почвенные индексы для Landsat 4/5
+var soilIndicesCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT45,
+  roi,
+  '1985-01-01',
+  '1995-12-31',
+  {
+    ndviThreshold: 0.2,  // только голые почвы
+    indices: ['EMBI', 'BITM', 'BIXS', 'BaI', 'DBSI', 'NDBaI', 'NDSoI', 'NSDS', 'RI4XS']
+  }
+);
+// Создаем композит
+var soilComposite = SatelliteProcessor.composites.median(soilIndicesCollection);
+// Визуализация
+Map.addLayer(
+  soilComposite.select('BITM'),
+  {min: -1, max: 1, palette: ['blue', 'white', 'red']},
+  'BITM Index'
+);
+/////////////////////////////////////
+// ПРИМЕР 4: Работа с категориями индексов
+/////////////////////////////////////
+// Получить список всех вегетационных индексов для Sentinel-2
+var vegIndices = SatelliteProcessor.indices.getSupported(
+  SatelliteProcessor.SENTINEL2, 
+  'vegetation'
+);
+print('Вегетационные индексы S2:', vegIndices);
+// Получить список всех водных индексов для Landsat 8/9
+var waterIndices = SatelliteProcessor.indices.getSupported(
+  SatelliteProcessor.LANDSAT89,
+  'water'
+);
+print('Водные индексы L8/9:', waterIndices);
+// Применить только водные индексы
+var waterCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT89,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    indices: waterIndices
+  }
+);
+/////////////////////////////////////
+// ПРИМЕР 5: Комбинированный анализ с выбором индексов
+/////////////////////////////////////
+// Определяем индексы для анализа изменений
+var changeIndices = ['NDVI', 'NDMI', 'NBR', 'EVI2', 'SAVI'];
+// Базовый период
+var baseCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2020-01-01',
+  '2020-12-31',
+  {
+    months: [5, 9],
+    indices: changeIndices
+  }
+);
+// Текущий период
+var currentCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    months: [5, 9],
+    indices: changeIndices
+  }
+);
+// Создаем композиты
+var baseComposite = SatelliteProcessor.composites.median(baseCollection);
+var currentComposite = SatelliteProcessor.composites.median(currentCollection);
+// Рассчитываем изменения
+var changes = currentComposite.subtract(baseComposite);
+// Визуализация изменений NDVI
+Map.addLayer(
+  changes.select('NDVI'),
+  {min: -0.3, max: 0.3, palette: ['red', 'white', 'green']},
+  'NDVI Change 2020-2023'
+);
+/////////////////////////////////////
+// ПРИМЕР 6: Проверка поддержки индексов
+/////////////////////////////////////
+// Проверить, поддерживается ли индекс
+var isNDRESupported = SatelliteProcessor.indices.isSupported(
+  SatelliteProcessor.SENTINEL2,
+  'NDRE'
+);
+print('NDRE поддерживается для S2:', isNDRESupported);
+// Получить категорию индекса
+var ndviCategory = SatelliteProcessor.indices.getCategory(
+  SatelliteProcessor.SENTINEL2,
+  'NDVI'
+);
+print('Категория NDVI:', ndviCategory);
+// Безопасное добавление индексов с проверкой
+var requestedIndices = ['NDVI', 'NDRE', 'CustomIndex'];
+var supportedOnly = requestedIndices.filter(function(idx) {
+  return SatelliteProcessor.indices.isSupported(SatelliteProcessor.SENTINEL2, idx);
+});
+print('Запрошенные индексы:', requestedIndices);
+print('Поддерживаемые индексы:', supportedOnly);
+var safeCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    indices: supportedOnly
+  }
+);
+/////////////////////////////////////
+// ПРИМЕР 3: Комбинированная обработка Landsat 4/5
+/////////////////////////////////////
+// Параметры для анализа почв
+var soilOptions = {
+  months: [4, 10],  // апрель-октябрь
+  ndviThreshold: 0.2  // только голые почвы
+};
+// Получаем коллекцию
+var landsat45Collection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT45,
+  roi,
+  '1985-01-01',
+  '1995-12-31',
+  soilOptions
+);
+// Добавляем почвенные индексы
+var l45WithSoilIndices = landsat45Collection.map(
+  SatelliteProcessor.addIndices.landsat45Soil
+);
+// Создаем медианный композит
+var soilComposite = SatelliteProcessor.composites.median(l45WithSoilIndices);
+// Визуализация индекса BITM
+Map.addLayer(
+  soilComposite.select('BITM'),
+  {min: -1, max: 1, palette: ['blue', 'white', 'red']},
+  'BITM Index'
+);
+/////////////////////////////////////
+// ПРИМЕР 4: Создание временных композитов по месяцам
+/////////////////////////////////////
+var months = [5, 7, 9];  // май, июль, сентябрь
+var year = 2023;
+months.forEach(function(month) {
+  // Получаем коллекцию для конкретного месяца
+  var monthlyCollection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    year + '-' + month + '-01',
+    year + '-' + (month + 1) + '-01',
+    {months: [month]}
+  );
+  
+  // Добавляем индексы
+  var withIndices = monthlyCollection.map(
+    SatelliteProcessor.addIndices.sentinel2Vegetation
+  );
+  
+  // Создаем медианный композит
+  var monthlyComposite = SatelliteProcessor.composites.median(withIndices);
+  
+  // Экспорт
+  Export.image.toAsset({
+    image: monthlyComposite,
+    description: 'S2_Composite_' + year + '_Month' + month,
+    assetId: 'projects/your-project/assets/S2_' + year + '_m' + month,
+    scale: 10,
+    region: roi,
+    maxPixels: 1e13
+  });
+});
+/////////////////////////////////////
+// ПРИМЕР 5: Расчет изменений NDRE между месяцами
+/////////////////////////////////////
+// Май
+var mayCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-05-01',
+  '2023-06-01'
+);
+// Июль
+var julyCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-07-01',
+  '2023-08-01'
+);
+// Добавляем индексы и создаем медианы
+var mayNDRE = mayCollection
+  .map(SatelliteProcessor.addIndices.sentinel2Vegetation)
+  .select('NDRE')
+  .median()
+  .rename('NDRE_May');
+var julyNDRE = julyCollection
+  .map(SatelliteProcessor.addIndices.sentinel2Vegetation)
+  .select('NDRE')
+  .median()
+  .rename('NDRE_July');
+// Вычисляем разницу
+var dNDRE = julyNDRE.subtract(mayNDRE).rename('dNDRE_JulMay');
+// Визуализация
+Map.addLayer(
+  dNDRE,
+  {min: -0.3, max: 0.3, palette: ['red', 'white', 'green']},
+  'NDRE Change (Jul-May)'
+);
+/////////////////////////////////////
+// ПРИМЕР 6: Продвинутая обработка с текстурами (GLCM)
+/////////////////////////////////////
+// Функция для добавления GLCM текстур
+function addGLCMTextures(img, bandName, windowSize) {
+  var band = img.select(bandName);
+  var quantized = band.unitScale(0, 10000).multiply(255).round().toByte();
+  var glcm = quantized.glcmTexture({size: windowSize, average: true});
+  
+  // Выбираем нужные метрики
+  var textures = ee.Image.cat([
+    glcm.select(bandName + '_contrast'),
+    glcm.select(bandName + '_var'),
+    glcm.select(bandName + '_asm').multiply(10000),
+    glcm.select(bandName + '_idm').multiply(10000),
+    glcm.select(bandName + '_corr').multiply(10000)
+  ]).round().toInt16();
+  
+  return img.addBands(textures);
+}
+// Применяем к коллекции
+var s2Collection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31'
+);
+// Создаем медианный композит
+var s2Median = SatelliteProcessor.composites.median(s2Collection);
+// Добавляем текстуры для разных каналов
+var withTextures = s2Median;
+withTextures = addGLCMTextures(withTextures, 'B8', 5);
+withTextures = addGLCMTextures(withTextures, 'B11', 5);
+withTextures = addGLCMTextures(withTextures, 'B5', 5);
+// Экспорт
+Export.image.toAsset({
+  image: withTextures,
+  description: 'S2_2023_with_GLCM_textures',
+  assetId: 'projects/your-project/assets/S2_2023_GLCM',
+  scale: 10,
+  region: roi,
+  maxPixels: 1e13
+});
+/////////////////////////////////////
+// ПРИМЕР 7: Подсчет валидных пикселей
+/////////////////////////////////////
+// Получаем коллекцию
+var collection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT89,
+  roi,
+  '2020-01-01',
+  '2024-12-31'
+);
+// Считаем количество валидных наблюдений
+var pixelCount = collection.select(['SR_B2']).count();
+// Визуализация
+Map.addLayer(
+  pixelCount,
+  {min: 0, max: 100, palette: ['white', 'blue', 'green', 'yellow', 'red']},
+  'Valid Pixel Count'
+);
+// Статистика
+var stats = pixelCount.reduceRegion({
+  reducer: ee.Reducer.percentile([10, 50, 90]),
+  geometry: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
+print('Статистика валидных пикселей:', stats);
