@@ -1,0 +1,611 @@
+/**
+ * ПРОДВИНУТЫЕ ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ
+ * Включает GLCM текстуры, временной анализ и сложные композиты
+ */
+var satLib = require('users/your_username/satellite-processing:satellite-processing');
+var SatelliteProcessor = satLib.SatelliteProcessor;
+/////////////////////////////////////
+// МОДУЛЬ GLCM ТЕКСТУР
+/////////////////////////////////////
+var GLCMProcessor = {
+  /**
+   * Квантизация изображения для GLCM
+   */
+  quantize255: function(img) {
+    return img.unitScale(0, 10000).multiply(255).round().toByte();
+  },
+  
+  /**
+   * Расчет GLCM метрик для одного канала
+   */
+  glcmMetrics: function(bandImg, bandName, windowSize) {
+    var quantized = this.quantize255(bandImg);
+    var texture = quantized.glcmTexture({
+      size: windowSize, 
+      average: true
+    });
+    
+    // Выбираем основные метрики и масштабируем
+    var metrics = ee.Image.cat([
+      texture.select(bandName + '_contrast'),                    // 0-65025
+      texture.select(bandName + '_var'),                         // 0-65025
+      texture.select(bandName + '_asm').multiply(10000),        // 0-10000
+      texture.select(bandName + '_idm').multiply(10000),
+      texture.select(bandName + '_corr').multiply(10000)
+    ]).round().toInt16();
+    
+    return metrics;
+  },
+  
+  /**
+   * Добавить GLCM текстуры к изображению
+   */
+  addGLCMTextures: function(img, bands, windowSize) {
+    windowSize = windowSize || 5;
+    
+    var textures = bands.map(function(bandName) {
+      var band = img.select(bandName);
+      return this.glcmMetrics(band, bandName, windowSize);
+    }, this);
+    
+    return img.addBands(ee.Image.cat(textures));
+  }
+};
+/////////////////////////////////////
+// ПРИМЕР 1: Полный процессинг Sentinel-2 с GLCM и выбором индексов
+/////////////////////////////////////
+function processSentinel2WithGLCM(roi, year) {
+  var START = year;
+  var END = START + 5;
+  var MONTHS = [5, 7, 9];
+  var CRS = 'EPSG:3035';
+  var SCALE = 10;
+  
+  // Определяем индексы для анализа
+  var vegIndices = ['NDVI', 'NDRE', 'EVI2', 'TSAVI', 'LAI', 'SAVI'];
+  
+  // Переменные для dNDRE
+  var NDRE_May, NDRE_Jul;
+  
+  // Обработка по месяцам
+  MONTHS.forEach(function(month) {
+    // Получаем чистую коллекцию с индексами
+    var collection = SatelliteProcessor.getCleanCollection(
+      SatelliteProcessor.SENTINEL2,
+      roi,
+      START + '-01-01',
+      END + '-12-31',
+      {
+        months: [month],
+        indices: vegIndices
+      }
+    );
+    
+    // Создаем медианные композиты
+    var SR_BANDS = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+    
+    // SR каналы с суффиксом _sr
+    var medianSR = collection.select(SR_BANDS).median();
+    var medianSR_renamed = medianSR.rename(
+      SR_BANDS.map(function(b) { return b + '_sr'; })
+    ).toInt16();
+    
+    // Индексы (уже рассчитаны в коллекции)
+    var indicesMedian = collection.select(vegIndices).median();
+    var indicesScaled = indicesMedian.multiply(10000).toInt16();
+    
+    // Базовый композит
+    var composite = ee.Image.cat([medianSR_renamed, indicesScaled]);
+    
+    // Добавляем GLCM текстуры
+    composite = GLCMProcessor.addGLCMTextures(
+      composite.addBands(medianSR), // добавляем оригинальные для GLCM
+      ['B8', 'B11', 'B5'],
+      5
+    );
+    
+    // Убираем временные оригинальные каналы
+    composite = composite.select(composite.bandNames().filter(
+      ee.Filter.stringStartsWith('item').not()
+    ));
+    
+    // Экспорт
+    Export.image.toAsset({
+      image: composite.clip(roi),
+      description: START + '_S2comp_5yr_m' + month + '_TX',
+      assetId: 'projects/your-project/assets/Sentinel2/' +
+                START + '_S2comp_5yr_m' + month + '_TX',
+      scale: SCALE,
+      region: roi,
+      maxPixels: 1e12,
+      crs: CRS
+    });
+    
+    // Сохраняем NDRE для dNDRE
+    if (month === 5) NDRE_May = indicesScaled.select('NDRE').rename('NDRE_May');
+    if (month === 7) NDRE_Jul = indicesScaled.select('NDRE').rename('NDRE_Jul');
+  });
+  
+  // Расчет dNDRE
+  if (NDRE_May && NDRE_Jul) {
+    var dNDRE = NDRE_Jul.subtract(NDRE_May)
+                        .rename('dNDRE_JulMay')
+                        .toInt16();
+    
+    Export.image.toAsset({
+      image: dNDRE.clip(roi),
+      description: START + '_dNDRE_JulMay_TX',
+      assetId: 'projects/your-project/assets/Sentinel2/' +
+               START + '_dNDRE_JulMay_TX',
+      scale: SCALE,
+      region: roi,
+      maxPixels: 1e12,
+      crs: CRS
+    });
+  }
+  
+  // Вегетационные статистики (май-сентябрь) с выбранными индексами
+  var vegCollection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    START + '-05-01',
+    START + '-09-30',
+    {
+      months: [5, 6, 7, 8, 9],
+      indices: vegIndices
+    }
+  );
+  
+  // Статистики для каждого индекса
+  var vegStats = ee.Image.cat(
+    vegIndices.map(function(index) {
+      return SatelliteProcessor.composites.statistics(vegCollection, index)
+                                          .multiply(10000).toInt16();
+    })
+  );
+  
+  // Добавляем GLCM для медианных NDVI и NDRE
+  var ndviMed = vegStats.select('NDVI_median').divide(10000);
+  var ndreMed = vegStats.select('NDRE_median').divide(10000);
+  
+  vegStats = vegStats
+    .addBands(GLCMProcessor.glcmMetrics(ndviMed, 'NDVI_median', 5))
+    .addBands(GLCMProcessor.glcmMetrics(ndreMed, 'NDRE_median', 5));
+  
+  Export.image.toAsset({
+    image: vegStats.clip(roi),
+    description: START + '_S2comp_5yr_vegstat_TX',
+    assetId: 'projects/your-project/assets/Sentinel2/' +
+             START + '_S2comp_5yr_vegstat_TX',
+    scale: SCALE,
+    region: roi,
+    maxPixels: 1e12,
+    crs: CRS
+  });
+}
+/////////////////////////////////////
+// ПРИМЕР 2: Комплексный анализ изменений
+/////////////////////////////////////
+function comprehensiveChangeAnalysis(roi, baseYear, targetYear) {
+  // Базовый период
+  var baseCollection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    baseYear + '-01-01',
+    baseYear + '-12-31',
+    {months: [5, 9]}
+  );
+  
+  // Целевой период
+  var targetCollection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    targetYear + '-01-01',
+    targetYear + '-12-31',
+    {months: [5, 9]}
+  );
+  
+  // Добавляем индексы
+  var baseWithIdx = baseCollection.map(
+    SatelliteProcessor.addIndices.sentinel2Vegetation
+  );
+  var targetWithIdx = targetCollection.map(
+    SatelliteProcessor.addIndices.sentinel2Vegetation
+  );
+  
+  // Создаем композиты со статистиками
+  var indices = ['NDVI', 'NDRE', 'EVI2'];
+  
+  var baseStats = ee.Image.cat(
+    indices.map(function(idx) {
+      return SatelliteProcessor.composites.statistics(baseWithIdx, idx)
+                                          .multiply(10000).toInt16();
+    })
+  );
+  
+  var targetStats = ee.Image.cat(
+    indices.map(function(idx) {
+      return SatelliteProcessor.composites.statistics(targetWithIdx, idx)
+                                          .multiply(10000).toInt16();
+    })
+  );
+  
+  // Расчет изменений для каждой метрики
+  var changes = ee.Image();
+  
+  indices.forEach(function(idx) {
+    ['median', 'mean', 'max', 'stdDev'].forEach(function(stat) {
+      var bandName = idx + '_' + stat;
+      var change = targetStats.select(bandName)
+                             .subtract(baseStats.select(bandName))
+                             .rename(bandName + '_change');
+      changes = changes.addBands(change);
+    });
+  });
+  
+  // Добавляем текстурные изменения
+  var baseNDVI = baseStats.select('NDVI_median').divide(10000);
+  var targetNDVI = targetStats.select('NDVI_median').divide(10000);
+  
+  var baseTexture = GLCMProcessor.glcmMetrics(baseNDVI, 'NDVI', 5);
+  var targetTexture = GLCMProcessor.glcmMetrics(targetNDVI, 'NDVI', 5);
+  
+  var textureChanges = targetTexture.subtract(baseTexture)
+                                   .rename(['contrast_change', 'var_change', 
+                                           'asm_change', 'idm_change', 'corr_change']);
+  
+  // Финальный композит изменений
+  var changeComposite = changes.addBands(textureChanges);
+  
+  // Экспорт
+  Export.image.toAsset({
+    image: changeComposite.clip(roi),
+    description: 'Change_Analysis_' + baseYear + '_to_' + targetYear,
+    assetId: 'projects/your-project/assets/Changes/' + 
+             baseYear + '_to_' + targetYear,
+    scale: 10,
+    region: roi,
+    maxPixels: 1e13
+  });
+  
+  // Визуализация
+  Map.addLayer(
+    changeComposite.select('NDVI_median_change'),
+    {min: -2000, max: 2000, palette: ['red', 'white', 'green']},
+    'NDVI Median Change'
+  );
+  
+  Map.addLayer(
+    changeComposite.select('contrast_change'),
+    {min: -1000, max: 1000, palette: ['blue', 'white', 'red']},
+    'Texture Contrast Change'
+  );
+  
+  return changeComposite;
+}
+/////////////////////////////////////
+// ПРИМЕР 3: Мультисенсорный анализ
+/////////////////////////////////////
+function multiSensorFusion(roi, year) {
+  // Sentinel-2 (10м)
+  var s2Collection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    year + '-01-01',
+    year + '-12-31',
+    {months: [5, 9]}
+  );
+  
+  // Landsat 8/9 (30м)
+  var lsCollection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.LANDSAT89,
+    roi,
+    year + '-01-01',
+    year + '-12-31',
+    {months: [5, 9]}
+  );
+  
+  // Создаем композиты
+  var s2Composite = s2Collection.median();
+  var lsComposite = lsCollection.median();
+  
+  // Пересэмплируем Landsat к разрешению Sentinel-2
+  var lsResampled = lsComposite.resample('bilinear')
+                               .reproject({
+                                 crs: s2Composite.projection(),
+                                 scale: 10
+                               });
+  
+  // Нормализуем имена каналов для объединения
+  var s2Renamed = s2Composite.select(
+    ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+    ['S2_Blue', 'S2_Green', 'S2_Red', 'S2_NIR', 'S2_SWIR1', 'S2_SWIR2']
+  );
+  
+  var lsRenamed = lsResampled.select(
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
+    ['LS_Blue', 'LS_Green', 'LS_Red', 'LS_NIR', 'LS_SWIR1', 'LS_SWIR2']
+  );
+  
+  // Объединяем
+  var multiSensor = s2Renamed.addBands(lsRenamed);
+  
+  // Добавляем уникальные каналы Sentinel-2
+  var s2Unique = s2Composite.select(['B5', 'B6', 'B7', 'B8A'])
+                            .rename(['RedEdge1', 'RedEdge2', 'RedEdge3', 'RedEdgeNIR']);
+  
+  multiSensor = multiSensor.addBands(s2Unique);
+  
+  // Рассчитываем кросс-сенсорные метрики
+  var crossNDVI = multiSensor.expression(
+    '(S2_NIR - LS_Red) / (S2_NIR + LS_Red)',
+    {
+      'S2_NIR': multiSensor.select('S2_NIR'),
+      'LS_Red': multiSensor.select('LS_Red')
+    }
+  ).rename('Cross_NDVI');
+  
+  multiSensor = multiSensor.addBands(crossNDVI);
+  
+  // Экспорт
+  Export.image.toAsset({
+    image: multiSensor.clip(roi),
+    description: 'MultiSensor_Fusion_' + year,
+    assetId: 'projects/your-project/assets/MultiSensor/fusion_' + year,
+    scale: 10,
+    region: roi,
+    maxPixels: 1e13
+  });
+  
+  return multiSensor;
+}
+/////////////////////////////////////
+// ПРИМЕР 5: Динамический выбор индексов по условиям
+/////////////////////////////////////
+function adaptiveIndexSelection(roi, year) {
+  // Предварительный анализ территории
+  var preAnalysis = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    year + '-06-01',
+    year + '-08-31',
+    {indices: ['NDVI', 'NDWI', 'BSI']}
+  );
+  
+  var preComposite = preAnalysis.median();
+  
+  // Определяем преобладающий тип покрытия
+  var stats = preComposite.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 100,
+    maxPixels: 1e9
+  });
+  
+  stats.evaluate(function(result) {
+    print('Предварительная статистика:', result);
+    
+    var selectedIndices = [];
+    
+    // Выбираем индексы в зависимости от типа территории
+    if (result.NDVI > 0.6) {
+      // Густая растительность
+      selectedIndices = SatelliteProcessor.indices.getSupported(
+        SatelliteProcessor.SENTINEL2,
+        'vegetation'
+      ).filter(function(idx) {
+        // Выбираем продвинутые вегетационные индексы
+        return ['EVI2', 'LAI', 'MTCI', 'REIP', 'CVI', 'GNDVI', 
+                'MCARI', 'TCARI', 'S2REP', 'IRECI'].indexOf(idx) !== -1;
+      });
+    } else if (result.NDWI > 0.2) {
+      // Водные объекты
+      selectedIndices = SatelliteProcessor.indices.getSupported(
+        SatelliteProcessor.SENTINEL2,
+        'water'
+      );
+    } else if (result.BSI > 0.1) {
+      // Открытые почвы
+      selectedIndices = SatelliteProcessor.indices.getSupported(
+        SatelliteProcessor.SENTINEL2,
+        'soil'
+      );
+    } else {
+      // Смешанный ландшафт - базовый набор
+      selectedIndices = ['NDVI', 'NDWI', 'BSI', 'EVI2', 'SAVI', 
+                        'NDMI', 'NBR', 'MNDWI'];
+    }
+    
+    print('Выбранные индексы:', selectedIndices);
+    print('Количество индексов:', selectedIndices.length);
+    
+    // Основная обработка с выбранными индексами
+    var mainCollection = SatelliteProcessor.getCleanCollection(
+      SatelliteProcessor.SENTINEL2,
+      roi,
+      year + '-01-01',
+      year + '-12-31',
+      {
+        months: [4, 5, 6, 7, 8, 9],
+        indices: selectedIndices
+      }
+    );
+    
+    // Создаем сезонные композиты
+    var seasons = {
+      'spring': [4, 5],
+      'summer': [6, 7, 8],
+      'autumn': [9]
+    };
+    
+    Object.keys(seasons).forEach(function(season) {
+      var seasonCol = mainCollection.filter(
+        ee.Filter.calendarRange(seasons[season][0], 
+                                seasons[season][seasons[season].length-1], 
+                                'month')
+      );
+      
+      var seasonComposite = seasonCol.median();
+      
+      // Добавляем текстуры для первых 3 индексов
+      var topIndices = selectedIndices.slice(0, 3);
+      topIndices.forEach(function(idx) {
+        var band = seasonComposite.select(idx);
+        var texture = GLCMProcessor.glcmMetrics(band, idx, 5);
+        seasonComposite = seasonComposite.addBands(texture);
+      });
+      
+      Export.image.toAsset({
+        image: seasonComposite.clip(roi),
+        description: 'Adaptive_' + season + '_' + year,
+        assetId: 'projects/your-project/assets/adaptive/' + 
+                 season + '_' + year,
+        scale: 10,
+        region: roi,
+        maxPixels: 1e13
+      });
+    });
+  });
+}
+/////////////////////////////////////
+// ПРИМЕР 6: Интеллектуальный выбор индексов для классификации
+/////////////////////////////////////
+function smartIndicesForClassification(roi, trainingData, classProperty) {
+  // Этап 1: Тестируем все доступные индексы
+  var allIndices = SatelliteProcessor.indices.getSupported(
+    SatelliteProcessor.SENTINEL2
+  );
+  
+  print('Всего доступно индексов:', allIndices.length);
+  
+  // Разбиваем на батчи для обработки (GEE limit)
+  var batchSize = 20;
+  var batches = [];
+  
+  for (var i = 0; i < allIndices.length; i += batchSize) {
+    batches.push(allIndices.slice(i, i + batchSize));
+  }
+  
+  // Обрабатываем каждый батч
+  var importanceResults = ee.Dictionary();
+  
+  batches.forEach(function(batch, batchIdx) {
+    // Получаем коллекцию с текущим батчем индексов
+    var testCollection = SatelliteProcessor.getCleanCollection(
+      SatelliteProcessor.SENTINEL2,
+      roi,
+      '2023-05-01',
+      '2023-08-31',
+      {indices: batch}
+    );
+    
+    var testComposite = testCollection.median();
+    
+    // Извлекаем значения для обучающих данных
+    var training = testComposite.sampleRegions({
+      collection: trainingData,
+      properties: [classProperty],
+      scale: 10
+    });
+    
+    // Оцениваем важность каждого индекса
+    batch.forEach(function(idx) {
+      var classifier = ee.Classifier.smileRandomForest(10)
+        .train({
+          features: training,
+          classProperty: classProperty,
+          inputProperties: [idx]
+        });
+      
+      var importance = classifier.explain()
+                                .get('importance')
+                                .get(idx);
+      
+      importanceResults = importanceResults.set(idx, importance);
+    });
+  });
+  
+  // Выбираем топ-15 индексов по важности
+  importanceResults.evaluate(function(results) {
+    var sortedIndices = Object.keys(results)
+      .sort(function(a, b) {
+        return results[b] - results[a];
+      })
+      .slice(0, 15);
+    
+    print('Топ-15 индексов по важности:', sortedIndices);
+    
+    // Финальная классификация с выбранными индексами
+    var finalCollection = SatelliteProcessor.getCleanCollection(
+      SatelliteProcessor.SENTINEL2,
+      roi,
+      '2023-01-01',
+      '2023-12-31',
+      {indices: sortedIndices}
+    );
+    
+    var finalComposite = finalCollection.median();
+    
+    // Добавляем текстуры для топ-3 индексов
+    sortedIndices.slice(0, 3).forEach(function(idx) {
+      var texture = GLCMProcessor.glcmMetrics(
+        finalComposite.select(idx), 
+        idx, 
+        5
+      );
+      finalComposite = finalComposite.addBands(texture);
+    });
+    
+    // Обучение финального классификатора
+    var finalTraining = finalComposite.sampleRegions({
+      collection: trainingData,
+      properties: [classProperty],
+      scale: 10
+    });
+    
+    var finalClassifier = ee.Classifier.smileRandomForest(100)
+      .train({
+        features: finalTraining,
+        classProperty: classProperty,
+        inputProperties: finalComposite.bandNames()
+      });
+    
+    var classified = finalComposite.classify(finalClassifier);
+    
+    // Экспорт результатов
+    Export.image.toAsset({
+      image: classified,
+      description: 'Smart_Classification_2023',
+      assetId: 'projects/your-project/assets/classification/smart_2023',
+      scale: 10,
+      region: roi,
+      maxPixels: 1e13
+    });
+    
+    Export.image.toAsset({
+      image: finalComposite,
+      description: 'Smart_Composite_2023',
+      assetId: 'projects/your-project/assets/composites/smart_2023',
+      scale: 10,
+      region: roi,
+      maxPixels: 1e13
+    });
+  });
+}
+/////////////////////////////////////
+// ИСПОЛЬЗОВАНИЕ
+/////////////////////////////////////
+// Определяем область
+var roi = ee.Geometry.Polygon(
+  [[[47.21360644986287, 56.70920436802264],
+    [47.21360644986287, 53.92232211836256],
+    [54.40965137173787, 53.92232211836256],
+    [54.40965137173787, 56.70920436802264]]],
+  null,
+  false
+);
+// Запуск примеров
+// processSentinel2WithGLCM(roi, 2020);
+// comprehensiveChangeAnalysis(roi, 2020, 2024);
+// multiSensorFusion(roi, 2023);
+// phenologyAnalysis(roi, 2023);
