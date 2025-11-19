@@ -1,0 +1,541 @@
+/**
+ * Универсальная библиотека для обработки спутниковых снимков
+ * Автор: А.М. Гафуров
+ * Версия: 1.3 (исправлены названия индексов согласно библиотеке spectral)
+ * 
+ * Поддерживаемые спутники:
+ * - Sentinel-2
+ * - Landsat 4/5
+ * - Landsat 8/9
+ */
+// =============================================================================
+// Polyfill: заменяем недоступный в среде GEE Object.assign функцией assign()
+// =============================================================================
+var assign = function (target) {
+  target = target || {};
+  for (var i = 1; i < arguments.length; i++) {
+    var source = arguments[i];
+    if (source) {
+      for (var key in source) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+          target[key] = source[key];
+        }
+      }
+    }
+  }
+  return target;
+};
+// Импорт необходимых модулей
+var spectral = require('users/dmlmont/spectral:spectral');
+/**
+ * Главный объект библиотеки
+ */
+var SatelliteProcessor = {
+  // ---------------------------------------------------------------------------
+  // Константы для типов спутников
+  // ---------------------------------------------------------------------------
+  SENTINEL2: 'sentinel2',
+  LANDSAT45: 'landsat45',
+  LANDSAT89: 'landsat89',
+  // ---------------------------------------------------------------------------
+  // Параметры по умолчанию
+  // ---------------------------------------------------------------------------
+  defaults: {
+    cloudThreshold: 0.85,
+    months: null, // null = все месяцы
+    ndviThreshold: null, // для маскирования растительности
+    classificationMask: null, // ee.Image с классами для маскирования
+    classesToExclude: [], // классы для исключения
+    indices: null, // null = не рассчитывать индексы
+    skipUnsupportedIndices: true // пропускать неподдерживаемые индексы
+  },
+  // ---------------------------------------------------------------------------
+  // Корректные наборы индексов из библиотеки spectral
+  // ---------------------------------------------------------------------------
+  supportedIndices: {
+    sentinel2: {
+      // Вегетационные индексы, доступные для Sentinel-2
+      vegetation: ['AFRI1600', 'AFRI2100', 'ARI', 'ARI2', 'ARVI', 'ATSAVI', 'AVI', 
+                   'BNDVI', 'BWDRVI', 'CIG', 'CIRE', 'CVI', 'DVI', 'EVI', 'EVI2', 
+                   'FCVI', 'GARI', 'GBNDVI', 'GCC', 'GDVI', 'GEMI', 'GLI', 'GNDVI', 
+                   'GRVI', 'GSAVI', 'GVMI', 'IPVI', 'IRECI', 'LAI', 'LCI', 'MCARI', 
+                   'MCARI1', 'MCARI2', 'MCARIOSAVI', 'MGRVI', 'MNLI', 'MRBVI', 
+                   'MSAVI', 'MSR', 'MTCI', 'MTVI1', 'MTVI2', 'NDDI', 'NDGI', 
+                   'NDII', 'NDMI', 'NDPI', 'NDREI', 'NDVI', 'NDWI', 'NGRDI', 
+                   'NIRv', 'NIRvH2', 'NIRvP', 'NMDI', 'NRFIg', 'NRFIr', 'OCVI', 
+                   'OSAVI', 'PSRI', 'RCC', 'RDVI', 'REIP', 'RENDVI', 'RGBVI', 
+                   'RGRI', 'RVI', 'S2REP', 'SARVI', 'SAVI', 'SAVI2', 'SIPI', 
+                   'sNIRvSWIR', 'SR', 'TCI', 'TGI', 'TRRVI', 'TSAVI', 'TTVI', 
+                   'TVI', 'VARI', 'VARI700', 'VIG', 'WDRVI', 'WDVI'],
+                   
+      // Водные индексы
+      water: ['AWEInsh', 'AWEIsh', 'LSWI', 'MBWI', 'MNDWI', 'NDWI', 'S2WI', 
+              'SWM', 'WI1', 'WI2', 'WRI'],
+              
+      // Почвенные индексы
+      soil: ['BAIM', 'BaI', 'BI', 'BITM', 'BIXS', 'BSI', 'DBSI', 'EMBI', 
+             'MBI', 'NDBaI', 'NDBI', 'NDSoI', 'NSDS', 'RI', 'RI4XS'],
+             
+      // Индексы для анализа гарей
+      burn: ['BAI', 'BAIS2', 'CSI', 'NBR', 'NBR2', 'NBRplus'],
+      
+      all: null // будет заполнено автоматически
+    },
+    
+    landsat45: {
+      vegetation: ['ARVI', 'ATSAVI', 'AVI', 'DVI', 'EVI', 'EVI2', 'GARI', 
+                   'GBNDVI', 'GDVI', 'GEMI', 'GLI', 'GNDVI', 'GRVI', 'GSAVI', 
+                   'GVMI', 'IPVI', 'LAI', 'MCARI1', 'MGRVI', 'MNLI', 'MRBVI', 
+                   'MSAVI', 'MSR', 'MTVI1', 'MTVI2', 'NDGI', 'NDMI', 'NDPI', 
+                   'NDSI', 'NDSII', 'NDVI', 'NDVIT', 'NDWI', 'NGRDI', 'NIRv', 
+                   'NIRvH2', 'NMDI', 'OCVI', 'OSAVI', 'RDVI', 'RVI', 'SARVI', 
+                   'SAVI', 'SAVI2', 'SR', 'TCI', 'TGI', 'TSAVI', 'TVI', 'VARI', 
+                   'VIG', 'WDRVI', 'WDVI'],
+                   
+      water: ['AWEInsh', 'AWEIsh', 'LSWI', 'MNDWI', 'NDWI', 'WI1', 'WI2'],
+      
+      soil: ['BAIM', 'BaI', 'BI', 'BITM', 'BIXS', 'BSI', 'CSIT', 'DBSI', 
+             'EMBI', 'MBI', 'NDBaI', 'NDBI', 'NDSoI', 'NSDS', 'RI', 'RI4XS'],
+             
+      burn: ['BAI', 'CSIT', 'NBR', 'NBR2', 'NBRT1', 'NBRT2', 'NBRT3', 
+             'NDVIT', 'SAVIT', 'VI6T'],
+             
+      all: null
+    },
+    
+    landsat89: {
+      vegetation: ['AFRI1600', 'AFRI2100', 'ARVI', 'ATSAVI', 'AVI', 'BWDRVI', 
+                   'CIG', 'CVI', 'DVI', 'EVI', 'EVI2', 'FCVI', 'GARI', 'GBNDVI', 
+                   'GCC', 'GDVI', 'GEMI', 'GLI', 'GNDVI', 'GRVI', 'GSAVI', 'GVMI', 
+                   'IPVI', 'LAI', 'LCI', 'MCARI1', 'MGRVI', 'MNLI', 'MRBVI', 
+                   'MSAVI', 'MSR', 'MTVI1', 'MTVI2', 'NDGI', 'NDMI', 'NDPI', 
+                   'NDSI', 'NDSII', 'NDVI', 'NDWI', 'NGRDI', 'NIRv', 'NIRvH2', 
+                   'NIRvP', 'NMDI', 'NRFIg', 'NRFIr', 'OCVI', 'OSAVI', 'RCC', 
+                   'RDVI', 'RGBVI', 'RGRI', 'RVI', 'SARVI', 'SAVI', 'SAVI2', 
+                   'SIPI', 'sNIRvSWIR', 'SR', 'TCI', 'TGI', 'TSAVI', 'TVI', 
+                   'VARI', 'VIG', 'WDRVI', 'WDVI'],
+                   
+      water: ['AWEInsh', 'AWEIsh', 'LSWI', 'MBWI', 'MNDWI', 'NDWI', 'SWM', 
+              'WI1', 'WI2', 'WRI'],
+              
+      soil: ['BAIM', 'BaI', 'BI', 'BITM', 'BIXS', 'BSI', 'DBSI', 'EMBI', 
+             'MBI', 'NDBI', 'NDSoI', 'NSDS', 'RI', 'RI4XS'],
+             
+      burn: ['BAI', 'CSI', 'NBR', 'NBR2'],
+      
+      all: null
+    }
+  },
+  // ---------------------------------------------------------------------------
+  // Инициализация библиотеки
+  // ---------------------------------------------------------------------------
+  init: function () {
+    // Заполняем списки всех индексов для каждого спутника
+    var self = this;
+    Object.keys(this.supportedIndices).forEach(function (satellite) {
+      var indices = self.supportedIndices[satellite];
+      var allIndices = [];
+      ['vegetation', 'water', 'soil', 'burn'].forEach(function (category) {
+        if (indices[category]) {
+          allIndices = allIndices.concat(indices[category]);
+        }
+      });
+      // Убираем дубликаты
+      indices.all = allIndices.filter(function (item, pos) {
+        return allIndices.indexOf(item) === pos;
+      });
+    });
+    return this;
+  },
+  // ---------------------------------------------------------------------------
+  // Основная функция для получения чистой коллекции
+  // ---------------------------------------------------------------------------
+  getCleanCollection: function (satelliteType, roi, startDate, endDate, options) {
+    var params = assign({}, this.defaults, options || {});
+    var collection;
+    
+    switch(satelliteType) {
+      case this.SENTINEL2:
+        collection = this._processSentinel2(roi, startDate, endDate, params);
+        break;
+      case this.LANDSAT45:
+        collection = this._processLandsat45(roi, startDate, endDate, params);
+        break;
+      case this.LANDSAT89:
+        collection = this._processLandsat89(roi, startDate, endDate, params);
+        break;
+      default:
+        throw new Error('Неподдерживаемый тип спутника: ' + satelliteType);
+    }
+    
+    // Добавляем индексы, если они заданы
+    if (params.indices !== null && params.indices.length > 0) {
+      var self = this;
+      collection = collection.map(function (img) {
+        return self.addIndices.universal(img, satelliteType, params.indices, params.skipUnsupportedIndices);
+      });
+    }
+    
+    return collection;
+  },
+  // ---------------------------------------------------------------------------
+  // Обработка Sentinel-2
+  // ---------------------------------------------------------------------------
+  _processSentinel2: function (roi, startDate, endDate, params) {
+    var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+    var cs = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+    
+    var collection = s2.filterBounds(roi).filterDate(startDate, endDate);
+    
+    // Фильтр по месяцам
+    if (params.months !== null) {
+      collection = collection.filter(
+        ee.Filter.calendarRange(
+          params.months[0],
+          params.months[params.months.length - 1],
+          'month'
+        )
+      );
+    }
+    
+    // Связываем с Cloud Score Plus
+    var join = ee.Join.inner();
+    var filter = ee.Filter.equals({
+      leftField: 'system:index',
+      rightField: 'system:index'
+    });
+    var joined = join.apply(collection, cs, filter);
+    collection = ee.ImageCollection(
+      joined.map(function (feat) {
+        var img = ee.Image(feat.get('primary'));
+        var csImg = ee.Image(feat.get('secondary'));
+        return img.addBands(csImg.select('cs_cdf'));
+      })
+    );
+    
+    // Маска по облакам
+    collection = collection.map(function (img) {
+      return img.updateMask(img.select('cs_cdf').gte(params.cloudThreshold));
+    });
+    
+    // Маскирование краёв
+    collection = collection.map(this._maskEdgesS2);
+    
+    // Пересэмплирование до 10 м
+    collection = collection.map(function (img) {
+      return img.resample('bilinear');
+    });
+    
+    // Маскирование по NDVI
+    if (params.ndviThreshold !== null) {
+      collection = collection.map(function (img) {
+        var ndvi = img.normalizedDifference(['B8', 'B3']);
+        return img.updateMask(ndvi.lte(params.ndviThreshold));
+      });
+    }
+    
+    // Маскирование по классификации
+    if (params.classificationMask !== null) {
+      collection = collection.map(this._applyClassificationMask(params));
+    }
+    
+    return collection;
+  },
+  // ---------------------------------------------------------------------------
+  // Обработка Landsat 4/5
+  // ---------------------------------------------------------------------------
+  _processLandsat45: function (roi, startDate, endDate, params) {
+    var l4 = ee.ImageCollection('LANDSAT/LT04/C02/T1_L2');
+    var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2');
+    
+    var processLandsat = function (collection) {
+      var col = collection.filterBounds(roi).filterDate(startDate, endDate);
+      
+      if (params.months !== null) {
+        col = col.filter(
+          ee.Filter.calendarRange(
+            params.months[0],
+            params.months[params.months.length - 1],
+            'month'
+          )
+        );
+      }
+      
+      // Масштабные коэффициенты
+      col = col.map(function (img) {
+        var optical = img.select('SR_B.').multiply(0.0000275).add(-0.2);
+        var thermal = img.select('ST_B6').multiply(0.00341802).add(149.0);
+        return img.addBands(optical, null, true).addBands(thermal, null, true);
+      });
+      
+      // Маскирование облаков
+      col = col.map(function (img) {
+        var qa = img.select('QA_PIXEL');
+        var mask = qa.bitwiseAnd(1 << 6).neq(0).or(qa.bitwiseAnd(1 << 7).neq(0));
+        return img.updateMask(mask);
+      });
+      
+      // Маскирование по NDVI
+      if (params.ndviThreshold !== null) {
+        col = col.map(function (img) {
+          var ndvi = img.normalizedDifference(['SR_B4', 'SR_B3']);
+          return img.updateMask(ndvi.lte(params.ndviThreshold));
+        });
+      }
+      
+      // Маскирование по классификации
+      if (params.classificationMask !== null) {
+        col = col.map(this._applyClassificationMask(params));
+      }
+      
+      return col;
+    }.bind(this);
+    
+    return processLandsat(l4).merge(processLandsat(l5));
+  },
+  // ---------------------------------------------------------------------------
+  // Обработка Landsat 8/9
+  // ---------------------------------------------------------------------------
+  _processLandsat89: function (roi, startDate, endDate, params) {
+    var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+    var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2');
+    
+    var processLandsat = function (collection) {
+      var col = collection.filterBounds(roi).filterDate(startDate, endDate);
+      
+      if (params.months !== null) {
+        col = col.filter(
+          ee.Filter.calendarRange(
+            params.months[0],
+            params.months[params.months.length - 1],
+            'month'
+          )
+        );
+      }
+      
+      // Масштабные коэффициенты
+      col = col.map(function (img) {
+        var optical = img.select('SR_B.').multiply(0.0000275).add(-0.2);
+        var thermal = img.select('ST_B.*').multiply(0.00341802).add(149.0);
+        return img.addBands(optical, null, true).addBands(thermal, null, true);
+      });
+      
+      // Маскирование облаков
+      col = col.map(function (img) {
+        var qaPixel = img.select('QA_PIXEL');
+        var cloudBitMask = 1 << 3;
+        var shadowBitMask = 1 << 4;
+        var mask = qaPixel.bitwiseAnd(cloudBitMask).eq(0)
+                         .and(qaPixel.bitwiseAnd(shadowBitMask).eq(0));
+        return img.updateMask(mask);
+      });
+      
+      // Маскирование по NDVI
+      if (params.ndviThreshold !== null) {
+        col = col.map(function (img) {
+          var ndvi = img.normalizedDifference(['SR_B5', 'SR_B4']);
+          return img.updateMask(ndvi.lte(params.ndviThreshold));
+        });
+      }
+      
+      // Маскирование по классификации
+      if (params.classificationMask !== null) {
+        col = col.map(this._applyClassificationMask(params));
+      }
+      
+      return col;
+    }.bind(this);
+    
+    return processLandsat(l8).merge(processLandsat(l9));
+  },
+  // ---------------------------------------------------------------------------
+  // Вспомогательные функции
+  // ---------------------------------------------------------------------------
+  _maskEdgesS2: function (img) {
+    return img.updateMask(img.select('B8A').mask().updateMask(img.select('B9').mask()));
+  },
+  _applyClassificationMask: function (params) {
+    return function (img) {
+      var classBand = params.classificationMask.select('b1');
+      var mask = ee.Image.constant(1);
+      params.classesToExclude.forEach(function (classValue) {
+        mask = mask.and(classBand.neq(classValue));
+      });
+      return img.updateMask(mask);
+    };
+  },
+  // ---------------------------------------------------------------------------
+  // Функции для добавления индексов
+  // ---------------------------------------------------------------------------
+  addIndices: {
+    /**
+     * Универсальная функция для добавления индексов с проверкой поддержки
+     */
+    universal: function (img, satelliteType, indices, skipUnsupported) {
+      var params;
+      
+      // Определяем параметры для spectral
+      if (satelliteType === SatelliteProcessor.SENTINEL2) {
+        params = {
+          A: img.select('B1'),   // Aerosol
+          B: img.select('B2'),   // Blue
+          G: img.select('B3'),   // Green
+          R: img.select('B4'),   // Red
+          RE1: img.select('B5'), // Red Edge 1
+          RE2: img.select('B6'), // Red Edge 2
+          RE3: img.select('B7'), // Red Edge 3
+          N: img.select('B8'),   // NIR
+          N2: img.select('B8A'), // NIR 2
+          S1: img.select('B11'), // SWIR 1
+          S2: img.select('B12'), // SWIR 2
+          T: img.select('B10'),  // Thermal (если нужен)
+          // Параметры для формул
+          g: 2.5, L: 1, C1: 6, C2: 7.5, gamma: 1, alpha: 0.1, 
+          sla: 1, slb: 0, nexp: 2, cexp: 1.16, k: 0.5,
+          fdelta: 0.581, nexp: 2, omega: 2,
+          beta: 0.05, theta: 0.08, t: 1
+        };
+      } else if (satelliteType === SatelliteProcessor.LANDSAT45) {
+        params = {
+          B: img.select('SR_B1'), // Blue
+          G: img.select('SR_B2'), // Green
+          R: img.select('SR_B3'), // Red
+          N: img.select('SR_B4'), // NIR
+          S1: img.select('SR_B5'), // SWIR 1
+          S2: img.select('SR_B7'), // SWIR 2
+          T: img.select('ST_B6'),  // Thermal
+          // Параметры для формул
+          g: 2.5, L: 1, C1: 6, C2: 7.5, gamma: 1, alpha: 0.1,
+          sla: 1, slb: 0, nexp: 2, cexp: 1.16, k: 0.5,
+          fdelta: 0.581, omega: 2, beta: 0.05
+        };
+      } else if (satelliteType === SatelliteProcessor.LANDSAT89) {
+        params = {
+          A: img.select('SR_B1'), // Aerosol
+          B: img.select('SR_B2'), // Blue
+          G: img.select('SR_B3'), // Green
+          R: img.select('SR_B4'), // Red
+          N: img.select('SR_B5'), // NIR
+          S1: img.select('SR_B6'), // SWIR 1
+          S2: img.select('SR_B7'), // SWIR 2
+          T1: img.select('ST_B10'), // Thermal 1
+          T2: img.select('ST_B11'), // Thermal 2
+          // Параметры для формул
+          g: 2.5, L: 1.0, C1: 6.0, C2: 7.5, gamma: 1.0, alpha: 0.1,
+          sla: 1, slb: 0, nexp: 2, cexp: 1.16, k: 0.5,
+          fdelta: 0.581, omega: 2, beta: 0.05
+        };
+      }
+      
+      // Фильтруем индексы, оставляя только поддерживаемые
+      var supportedList = SatelliteProcessor.supportedIndices[satelliteType].all;
+      var validIndices = indices.filter(function(idx) {
+        var isSupported = supportedList.indexOf(idx) !== -1;
+        if (!isSupported && !skipUnsupported) {
+          print('ВНИМАНИЕ: Индекс "' + idx + '" не поддерживается для ' + satelliteType);
+        }
+        return isSupported;
+      });
+      
+      if (validIndices.length === 0) {
+        print('Нет поддерживаемых индексов для расчета');
+        return img;
+      }
+      
+      // Рассчитываем индексы
+      try {
+        var computedIndices = spectral.computeIndex(img, validIndices, params);
+        return img.addBands(computedIndices);
+      } catch (e) {
+        print('Ошибка при расчете индексов:', e);
+        return img;
+      }
+    },
+    
+    // Удобные обертки
+    sentinel2Vegetation: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.sentinel2.vegetation;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.SENTINEL2, indices, true);
+    },
+    
+    landsat45Soil: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.landsat45.soil;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.LANDSAT45, indices, true);
+    },
+    
+    landsat89Vegetation: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.landsat89.vegetation;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.LANDSAT89, indices, true);
+    },
+    
+    sentinel2All: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.sentinel2.all;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.SENTINEL2, indices, true);
+    },
+    
+    landsat45All: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.landsat45.all;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.LANDSAT45, indices, true);
+    },
+    
+    landsat89All: function (img, indices) {
+      indices = indices || SatelliteProcessor.supportedIndices.landsat89.all;
+      return SatelliteProcessor.addIndices.universal(img, SatelliteProcessor.LANDSAT89, indices, true);
+    }
+  },
+  // ---------------------------------------------------------------------------
+  // Функции для создания композитов
+  // ---------------------------------------------------------------------------
+  composites: {
+    median: function (collection, bands) {
+      return bands ? collection.select(bands).median() : collection.median();
+    },
+    
+    statistics: function (collection, band) {
+      var combo = ee.Reducer.median()
+        .combine({ reducer2: ee.Reducer.mean(), sharedInputs: true })
+        .combine({ reducer2: ee.Reducer.max(), sharedInputs: true })
+        .combine({ reducer2: ee.Reducer.stdDev(), sharedInputs: true });
+      
+      var img = collection.select(band).reduce(combo);
+      var names = ['median', 'mean', 'max', 'stdDev'].map(function (s) {
+        return band + '_' + s;
+      });
+      return img.rename(names);
+    }
+  },
+  // ---------------------------------------------------------------------------
+  // Утилиты для работы с индексами
+  // ---------------------------------------------------------------------------
+  indices: {
+    getSupported: function (satelliteType, category) {
+      if (!SatelliteProcessor.supportedIndices[satelliteType]) {
+        throw new Error('Неизвестный тип спутника: ' + satelliteType);
+      }
+      return category ? 
+        SatelliteProcessor.supportedIndices[satelliteType][category] || [] : 
+        SatelliteProcessor.supportedIndices[satelliteType].all || [];
+    },
+    
+    isSupported: function (satelliteType, indexName) {
+      return this.getSupported(satelliteType).indexOf(indexName) !== -1;
+    },
+    
+    getCategory: function (satelliteType, indexName) {
+      var categories = ['vegetation', 'water', 'soil', 'burn'];
+      var indices = SatelliteProcessor.supportedIndices[satelliteType];
+      for (var i = 0; i < categories.length; i++) {
+        var cat = categories[i];
+        if (indices[cat] && indices[cat].indexOf(indexName) !== -1) {
+          return cat;
+        }
+      }
+      return null;
+    }
+  }
+};
+// -----------------------------------------------------------------------------
+// Инициализация и экспорт библиотеки
+// -----------------------------------------------------------------------------
+SatelliteProcessor.init();
+exports.SatelliteProcessor = SatelliteProcessor;
