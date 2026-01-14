@@ -1,7 +1,7 @@
 /**
  * Универсальная библиотека для обработки спутниковых снимков
  * Автор: А.М. Гафуров
- * Версия: 1.3 (исправлены названия индексов согласно библиотеке spectral)
+ * Версия: 1.4 (добавлен расчет характеристик фенологии)
  * 
  * Поддерживаемые спутники:
  * - Sentinel-2
@@ -47,7 +47,14 @@ var SatelliteProcessor = {
     classificationMask: null, // ee.Image с классами для маскирования
     classesToExclude: [], // классы для исключения
     indices: null, // null = не рассчитывать индексы
-    skipUnsupportedIndices: true // пропускать неподдерживаемые индексы
+    skipUnsupportedIndices: true, // пропускать неподдерживаемые индексы
+    keepTechnicalBands: false // сохранять технические бэнды (QA, MSK, cs_cdf и т.д.)
+  },
+  // ---------------------------------------------------------------------------
+  // Алиасы для индексов (короткие имена)
+  // ---------------------------------------------------------------------------
+  indexAliases: {
+    'NDRE': 'NDREI'  // Normalized Difference Red Edge Index
   },
   // ---------------------------------------------------------------------------
   // Корректные наборы индексов из библиотеки spectral
@@ -148,6 +155,12 @@ var SatelliteProcessor = {
     return this;
   },
   // ---------------------------------------------------------------------------
+  // Вспомогательная функция для преобразования алиасов
+  // ---------------------------------------------------------------------------
+  _resolveIndexAlias: function (indexName) {
+    return this.indexAliases[indexName] || indexName;
+  },
+  // ---------------------------------------------------------------------------
   // Основная функция для получения чистой коллекции
   // ---------------------------------------------------------------------------
   getCleanCollection: function (satelliteType, roi, startDate, endDate, options) {
@@ -175,7 +188,16 @@ var SatelliteProcessor = {
         return self.addIndices.universal(img, satelliteType, params.indices, params.skipUnsupportedIndices);
       });
     }
-    
+
+    // Удаляем технические бэнды, если требуется
+    if (!params.keepTechnicalBands) {
+      var self = this;
+      var indicesToKeep = params.indices || [];
+      collection = collection.map(function (img) {
+        return self.bands.selectUseful(img, satelliteType, indicesToKeep);
+      });
+    }
+
     return collection;
   },
   // ---------------------------------------------------------------------------
@@ -427,9 +449,14 @@ var SatelliteProcessor = {
         };
       }
       
+      // Преобразуем алиасы в настоящие имена индексов
+      var resolvedIndices = indices.map(function(idx) {
+        return SatelliteProcessor._resolveIndexAlias(idx);
+      });
+
       // Фильтруем индексы, оставляя только поддерживаемые
       var supportedList = SatelliteProcessor.supportedIndices[satelliteType].all;
-      var validIndices = indices.filter(function(idx) {
+      var validIndices = resolvedIndices.filter(function(idx) {
         var isSupported = supportedList.indexOf(idx) !== -1;
         if (!isSupported && !skipUnsupported) {
           print('ВНИМАНИЕ: Индекс "' + idx + '" не поддерживается для ' + satelliteType);
@@ -491,17 +518,207 @@ var SatelliteProcessor = {
       return bands ? collection.select(bands).median() : collection.median();
     },
     
-    statistics: function (collection, band) {
+    statistics: function (collection) {
+      // Обработка аргументов - может быть:
+      // 1. statistics(collection, 'NDVI') - один индекс строкой
+      // 2. statistics(collection, ['NDVI', 'NDRE']) - массив индексов
+      // 3. statistics(collection, {indices: ['NDVI', 'NDRE']}) - объект опций
+      // 4. statistics(collection, 'NDVI', 'NDRE', 'EVI2') - несколько индексов как отдельные аргументы
+
+      var bands = [];
+
+      if (arguments.length < 2) {
+        throw new Error('statistics требует минимум 2 аргумента: collection и индексы');
+      }
+
+      if (arguments.length === 2) {
+        var arg = arguments[1];
+        if (typeof arg === 'string') {
+          // Случай 1: один индекс
+          bands = [arg];
+        } else if (arg instanceof Array) {
+          // Случай 2: массив индексов
+          bands = arg;
+        } else if (arg && arg.indices) {
+          // Случай 3: объект опций
+          bands = arg.indices;
+        } else {
+          throw new Error('Неверный аргумент для функции statistics');
+        }
+      } else {
+        // Случай 4: несколько индексов как отдельные аргументы
+        for (var i = 1; i < arguments.length; i++) {
+          bands.push(arguments[i]);
+        }
+      }
+
+      // Преобразуем алиасы в настоящие имена индексов
+      var resolvedBands = [];
+      for (var i = 0; i < bands.length; i++) {
+        resolvedBands.push(SatelliteProcessor._resolveIndexAlias(bands[i]));
+      }
+
       var combo = ee.Reducer.median()
         .combine({ reducer2: ee.Reducer.mean(), sharedInputs: true })
         .combine({ reducer2: ee.Reducer.max(), sharedInputs: true })
         .combine({ reducer2: ee.Reducer.stdDev(), sharedInputs: true });
-      
-      var img = collection.select(band).reduce(combo);
-      var names = ['median', 'mean', 'max', 'stdDev'].map(function (s) {
-        return band + '_' + s;
-      });
-      return img.rename(names);
+
+      // Обрабатываем каждый индекс
+      var results = [];
+      for (var j = 0; j < resolvedBands.length; j++) {
+        var band = resolvedBands[j];
+        var img = collection.select(band).reduce(combo);
+        var names = ['median', 'mean', 'max', 'stdDev'].map(function (s) {
+          return band + '_' + s;
+        });
+        results.push(img.rename(names));
+      }
+
+      // Объединяем все результаты
+      if (results.length === 1) {
+        return results[0];
+      } else {
+        var result = results[0];
+        for (var k = 1; k < results.length; k++) {
+          result = result.addBands(results[k]);
+        }
+        return result;
+      }
+    },
+
+    /**
+     * Объединяет спектральные бэнды композита со статистиками индексов без дубликатов
+     * @param {ee.Image} composite - медианный композит со спектральными бэндами и индексами
+     * @param {ee.Image} statistics - результат функции statistics() со статистиками индексов
+     * @param {ee.Image|String} arg3 - либо phenology (ee.Image), либо satelliteType (String)
+     * @param {String} arg4 - satelliteType (если arg3 это phenology)
+     * @returns {ee.Image} изображение со спектральными бэндами, статистиками и опционально фенологией
+     */
+    mergeWithStats: function (composite, statistics, arg3, arg4) {
+      var satelliteType;
+      var phenology = null;
+
+      // Определяем, какие аргументы переданы
+      if (arguments.length === 3) {
+        // Старый вариант: mergeWithStats(composite, statistics, satelliteType)
+        satelliteType = arg3;
+      } else if (arguments.length === 4) {
+        // Новый вариант: mergeWithStats(composite, statistics, phenology, satelliteType)
+        phenology = arg3;
+        satelliteType = arg4;
+      } else {
+        throw new Error('mergeWithStats требует 3 или 4 аргумента');
+      }
+
+      // Получаем список спектральных бэндов
+      var spectralBands = SatelliteProcessor.bands.spectralBands[satelliteType] || [];
+
+      // Выбираем только спектральные бэнды из композита
+      var spectralComposite = composite.select(spectralBands);
+
+      // Объединяем спектральные бэнды со статистиками
+      var result = spectralComposite.addBands(statistics);
+
+      // Добавляем фенологию, если она есть
+      if (phenology !== null) {
+        result = result.addBands(phenology);
+      }
+
+      return result;
+    }
+  },
+  // ---------------------------------------------------------------------------
+  // Утилиты для работы с бэндами
+  // ---------------------------------------------------------------------------
+  bands: {
+    // Технические бэнды для каждого типа спутника
+    technicalBands: {
+      sentinel2: [
+        'AOT', 'WVP', 'SCL',  // Atmospheric and Scene Classification
+        'TCI_R', 'TCI_G', 'TCI_B',  // True Color Image
+        'MSK_CLDPRB', 'MSK_SNWPRB',  // Cloud and Snow probability
+        'QA10', 'QA20', 'QA60',  // Quality Assessment
+        'MSK_CLASSI_OPAQUE', 'MSK_CLASSI_CIRRUS', 'MSK_CLASSI_SNOW_ICE',  // Classification masks
+        'cs_cdf'  // Cloud Score
+      ],
+      landsat45: [
+        'QA_PIXEL', 'QA_RADSAT', 'SR_ATMOS_OPACITY', 'SR_CLOUD_QA',
+        'ST_ATRAN', 'ST_CDIST', 'ST_DRAD', 'ST_EMIS', 'ST_EMSD', 'ST_QA', 'ST_TRAD', 'ST_URAD'
+      ],
+      landsat89: [
+        'QA_PIXEL', 'QA_RADSAT', 'SR_QA_AEROSOL',
+        'ST_ATRAN', 'ST_CDIST', 'ST_DRAD', 'ST_EMIS', 'ST_EMSD', 'ST_QA', 'ST_TRAD', 'ST_URAD'
+      ]
+    },
+
+    // Основные спектральные бэнды для каждого типа спутника
+    spectralBands: {
+      sentinel2: ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12'],
+      landsat45: ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'ST_B6'],
+      landsat89: ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10', 'ST_B11']
+    },
+
+    /**
+     * Выбирает только спектральные бэнды и индексы, удаляет технические бэнды и дубликаты
+     * @param {ee.Image} img - изображение
+     * @param {String} satelliteType - тип спутника
+     * @param {Array} indices - список рассчитанных индексов
+     * @returns {ee.Image} изображение только с нужными бэндами
+     */
+    selectUseful: function (img, satelliteType, indices) {
+      var spectralList = this.spectralBands[satelliteType] || [];
+      var technicalList = this.technicalBands[satelliteType] || [];
+
+      // Преобразуем алиасы индексов
+      var resolvedIndices = [];
+      for (var i = 0; i < indices.length; i++) {
+        resolvedIndices.push(SatelliteProcessor._resolveIndexAlias(indices[i]));
+      }
+
+      // Получаем все бэнды изображения
+      var allBands = img.bandNames();
+
+      // Создаём список бэндов для сохранения (спектральные + индексы)
+      var bandsToKeep = ee.List(spectralList).cat(ee.List(resolvedIndices));
+      var technicalEE = ee.List(technicalList);
+
+      // Фильтруем бэнды используя iterate
+      var filtered = ee.List(allBands.iterate(function(bandName, list) {
+        bandName = ee.String(bandName);
+        list = ee.List(list);
+
+        // Проверяем условия
+        var isDuplicate = bandName.match('_[0-9]+$').size().gt(0);
+        var isTechnical = technicalEE.contains(bandName);
+        var isInKeepList = bandsToKeep.contains(bandName);
+
+        // Добавляем бэнд в список, если он проходит все проверки
+        // НЕ дубликат И НЕ технический И в списке нужных
+        var shouldAdd = ee.Algorithms.If(
+          isDuplicate,
+          false,
+          ee.Algorithms.If(
+            isTechnical,
+            false,
+            isInKeepList
+          )
+        );
+
+        return ee.List(ee.Algorithms.If(
+          shouldAdd,
+          list.add(bandName),
+          list
+        ));
+      }, ee.List([])));
+
+      // Если список пустой, возвращаем оригинальное изображение
+      var hasBands = filtered.size().gt(0);
+
+      return ee.Image(ee.Algorithms.If(
+        hasBands,
+        img.select(filtered),
+        img
+      ));
     }
   },
   // ---------------------------------------------------------------------------
@@ -531,6 +748,86 @@ var SatelliteProcessor = {
         }
       }
       return null;
+    }
+  },
+  // ---------------------------------------------------------------------------
+  // Фенологический анализ
+  // ---------------------------------------------------------------------------
+  phenology: {
+    /**
+     * Рассчитывает фенологические параметры на основе временного ряда индекса
+     * @param {ee.ImageCollection} collection - коллекция с рассчитанным индексом
+     * @param {Object} options - параметры:
+     *   - indexName: название индекса для анализа (по умолчанию 'NDVI')
+     *   - sosThreshold: порог для определения SOS (по умолчанию 0.25)
+     *   - eosThreshold: порог для определения EOS (по умолчанию 0.25)
+     * @returns {ee.Image} изображение с бэндами:
+     *   - peakDOY: день года с максимальным значением индекса
+     *   - peakValue: максимальное значение индекса
+     *   - SOS: день начала сезона - первый день когда индекс > sosThreshold
+     *   - EOS: день окончания сезона - последний день когда индекс > eosThreshold
+     *   - LOS: длина сезона в днях (EOS - SOS)
+     */
+    calculateSeasonMetrics: function (collection, options) {
+      options = options || {};
+      var indexName = options.indexName || 'NDVI';
+      var sosThreshold = (options.sosThreshold !== undefined) ? options.sosThreshold : 0.25;
+      var eosThreshold = (options.eosThreshold !== undefined) ? options.eosThreshold : 0.25;
+
+      // Преобразуем алиас индекса
+      indexName = SatelliteProcessor._resolveIndexAlias(indexName);
+
+      // Добавляем DOY как отдельный бэнд
+      var withDOY = collection.map(function (img) {
+        var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+        var doyBand = ee.Image.constant(doy).rename('DOY').toInt();
+        // важно: оставляем и индекс, и DOY
+        return img.select([indexName]).addBands(doyBand);
+      }).sort('system:time_start');
+
+      // 1) peakValue и peakDOY через qualityMosaic
+      // qualityMosaic берет пиксели из изображения с максимальным значением indexName
+      var peakImg = withDOY.qualityMosaic(indexName);
+
+      var peakValue = peakImg.select(indexName)
+        .rename('peakValue')
+        .unmask(-1);
+
+      var peakDOY = peakImg.select('DOY')
+        .rename('peakDOY')
+        .unmask(-1)
+        .toInt();
+
+      // 2) SOS: минимальный DOY, где index > sosThreshold
+      var sosMaskedDOY = withDOY.map(function (img) {
+        var m = img.select(indexName).gt(sosThreshold);
+        return img.select('DOY').updateMask(m);
+      });
+
+      var SOS = sosMaskedDOY
+        .reduce(ee.Reducer.min())
+        .rename('SOS')
+        .unmask(-1)
+        .toInt();
+
+      // 3) EOS: максимальный DOY, где index > eosThreshold
+      var eosMaskedDOY = withDOY.map(function (img) {
+        var m = img.select(indexName).gt(eosThreshold);
+        return img.select('DOY').updateMask(m);
+      });
+
+      var EOS = eosMaskedDOY
+        .reduce(ee.Reducer.max())
+        .rename('EOS')
+        .unmask(-1)
+        .toInt();
+
+      // 4) LOS: длина сезона
+      var LOS = EOS.subtract(SOS)
+        .rename('LOS')
+        .toInt();
+
+      return ee.Image.cat([peakDOY, peakValue, SOS, EOS, LOS]);
     }
   }
 };
