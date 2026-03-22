@@ -121,8 +121,32 @@ var options = {
   ndviThreshold: 0.2,          // Маскировать пиксели с NDVI > значения
   classificationMask: image,   // ee.Image с классификацией
   classesToExclude: [1, 2],    // Классы для исключения
-  indices: ['NDVI', 'NDRE']    // Список индексов для расчета (null = не считать)
+  indices: ['NDVI', 'NDRE'],   // Список индексов для расчета (null = не считать)
+  maxImages: 24,               // Ограничить число снимков при тяжелой обработке
+  preferLatestImages: true,    // При maxImages брать более свежие снимки
+  indexBatchSize: 8,           // Считать индексы батчами против OOM/timeout
+  resampleMethod: null,        // null = отключить resample ради скорости
+  dropUnusedBandsEarly: true   // Рано удалять лишние служебные бэнды
 };
+```
+
+### Анти-OOM режим для сложных параллельных расчетов
+```javascript
+var safeCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    months: [5, 9],
+    indices: ['NDVI', 'NDRE', 'EVI2', 'NDMI', 'NDWI', 'NBR'],
+    maxImages: 18,
+    preferLatestImages: true,
+    indexBatchSize: 4,
+    resampleMethod: null,
+    dropUnusedBandsEarly: true
+  }
+);
 ```
 
 ## Работа с индексами
@@ -600,6 +624,41 @@ var monthlyComposites = months.map(function(month) {
   );
   return collection.median().set('month', m);
 });
+```
+
+### Проблема: `Computation timed out` или зависание на большом списке индексов
+**Решение:** ограничьте число сцен и разбейте расчет индексов на батчи
+```javascript
+var optimized = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    indices: SatelliteProcessor.supportedIndices.sentinel2.vegetation,
+    maxImages: 20,
+    indexBatchSize: 5,
+    resampleMethod: null
+  }
+);
+
+var composite = SatelliteProcessor.composites.median(optimized);
+```
+
+### Проблема: перегрузка из-за лишних бэндов в промежуточных шагах
+**Решение:** сбрасывайте технические каналы до расчета индексов
+```javascript
+var lean = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.LANDSAT89,
+  roi,
+  '2021-01-01',
+  '2024-12-31',
+  {
+    indices: ['NDVI', 'NDMI', 'NBR'],
+    keepTechnicalBands: false,
+    dropUnusedBandsEarly: true
+  }
+);
 ```
 
 ## Заключение

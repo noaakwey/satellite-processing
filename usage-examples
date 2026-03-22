@@ -199,6 +199,23 @@ var safeCollection = SatelliteProcessor.getCleanCollection(
     indices: supportedOnly
   }
 );
+// Анти-OOM вариант для презентаций и сложных параллельных задач
+var presentationCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2023-01-01',
+  '2023-12-31',
+  {
+    months: [5, 9],
+    indices: ['NDVI', 'NDRE', 'EVI2', 'NDMI', 'NDWI', 'NBR'],
+    maxImages: 18,
+    preferLatestImages: true,
+    indexBatchSize: 4,
+    resampleMethod: null,
+    dropUnusedBandsEarly: true
+  }
+);
+var presentationComposite = SatelliteProcessor.composites.median(presentationCollection);
 /////////////////////////////////////
 // ПРИМЕР 3: Комбинированная обработка Landsat 4/5
 /////////////////////////////////////
