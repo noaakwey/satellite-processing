@@ -48,7 +48,12 @@ var SatelliteProcessor = {
     classesToExclude: [], // классы для исключения
     indices: null, // null = не рассчитывать индексы
     skipUnsupportedIndices: true, // пропускать неподдерживаемые индексы
-    keepTechnicalBands: false // сохранять технические бэнды (QA, MSK, cs_cdf и т.д.)
+    keepTechnicalBands: false, // сохранять технические бэнды (QA, MSK, cs_cdf и т.д.)
+    maxImages: null, // ограничить число снимков для тяжелых вычислений
+    preferLatestImages: true, // при maxImages брать последние снимки
+    indexBatchSize: 12, // рассчитывать индексы батчами для снижения нагрузки
+    resampleMethod: 'bilinear', // null = отключить resample для ускорения
+    dropUnusedBandsEarly: true // удалять ненужные бэнды до расчета индексов
   },
   // ---------------------------------------------------------------------------
   // Алиасы для индексов (короткие имена)
@@ -180,12 +185,24 @@ var SatelliteProcessor = {
       default:
         throw new Error('Неподдерживаемый тип спутника: ' + satelliteType);
     }
+
+    collection = this._limitCollectionSize(collection, params);
+
+    if (params.dropUnusedBandsEarly) {
+      collection = this._trimCollectionForAnalysis(collection, satelliteType, params);
+    }
     
     // Добавляем индексы, если они заданы
     if (params.indices !== null && params.indices.length > 0) {
       var self = this;
       collection = collection.map(function (img) {
-        return self.addIndices.universal(img, satelliteType, params.indices, params.skipUnsupportedIndices);
+        return self.addIndices.universal(
+          img,
+          satelliteType,
+          params.indices,
+          params.skipUnsupportedIndices,
+          params.indexBatchSize
+        );
       });
     }
 
@@ -244,9 +261,11 @@ var SatelliteProcessor = {
     collection = collection.map(this._maskEdgesS2);
     
     // Пересэмплирование до 10 м
-    collection = collection.map(function (img) {
-      return img.resample('bilinear');
-    });
+    if (params.resampleMethod !== null) {
+      collection = collection.map(function (img) {
+        return img.resample(params.resampleMethod);
+      });
+    }
     
     // Маскирование по NDVI
     if (params.ndviThreshold !== null) {
@@ -376,6 +395,22 @@ var SatelliteProcessor = {
   _maskEdgesS2: function (img) {
     return img.updateMask(img.select('B8A').mask().updateMask(img.select('B9').mask()));
   },
+  _limitCollectionSize: function (collection, params) {
+    if (params.maxImages === null || params.maxImages === undefined) {
+      return collection;
+    }
+
+    if (params.maxImages <= 0) {
+      throw new Error('maxImages должен быть больше 0');
+    }
+
+    var sorted = collection.sort('system:time_start', !params.preferLatestImages);
+    return sorted.limit(params.maxImages);
+  },
+  _trimCollectionForAnalysis: function (collection, satelliteType, params) {
+    var bandsToKeep = this.bands.getProcessingBands(satelliteType, params.keepTechnicalBands);
+    return collection.select(bandsToKeep);
+  },
   _applyClassificationMask: function (params) {
     return function (img) {
       var classBand = params.classificationMask.select('b1');
@@ -393,7 +428,7 @@ var SatelliteProcessor = {
     /**
      * Универсальная функция для добавления индексов с проверкой поддержки
      */
-    universal: function (img, satelliteType, indices, skipUnsupported) {
+    universal: function (img, satelliteType, indices, skipUnsupported, batchSize) {
       var params;
       
       // Определяем параметры для spectral
@@ -468,10 +503,22 @@ var SatelliteProcessor = {
         print('Нет поддерживаемых индексов для расчета');
         return img;
       }
+
+      batchSize = batchSize || validIndices.length;
+      if (batchSize <= 0) {
+        batchSize = validIndices.length;
+      }
       
       // Рассчитываем индексы
       try {
-        var computedIndices = spectral.computeIndex(img, validIndices, params);
+        var computedIndices = null;
+        for (var batchStart = 0; batchStart < validIndices.length; batchStart += batchSize) {
+          var batch = validIndices.slice(batchStart, batchStart + batchSize);
+          var batchImage = spectral.computeIndex(img, batch, params);
+          computedIndices = computedIndices === null ?
+            batchImage :
+            computedIndices.addBands(batchImage);
+        }
         return img.addBands(computedIndices);
       } catch (e) {
         print('Ошибка при расчете индексов:', e);
@@ -656,6 +703,11 @@ var SatelliteProcessor = {
       sentinel2: ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12'],
       landsat45: ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'ST_B6'],
       landsat89: ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10', 'ST_B11']
+    },
+    getProcessingBands: function (satelliteType, keepTechnicalBands) {
+      var spectralList = this.spectralBands[satelliteType] || [];
+      var technicalList = keepTechnicalBands ? (this.technicalBands[satelliteType] || []) : [];
+      return spectralList.concat(technicalList);
     },
 
     /**
