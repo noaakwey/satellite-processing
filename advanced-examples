@@ -609,3 +609,45 @@ var roi = ee.Geometry.Polygon(
 // comprehensiveChangeAnalysis(roi, 2020, 2024);
 // multiSensorFusion(roi, 2023);
 // phenologyAnalysis(roi, 2023);
+
+/////////////////////////////////////
+// ПРИМЕР 4: Гармоническая модель для мониторинга деградации
+/////////////////////////////////////
+function harmonicCropMonitoring(roi, startDate, endDate) {
+  var collection = SatelliteProcessor.getCleanCollection(
+    SatelliteProcessor.SENTINEL2,
+    roi,
+    startDate,
+    endDate,
+    {
+      months: [4, 10],
+      indices: ['NDVI', 'NDRE']
+    }
+  );
+
+  var ndviModel = SatelliteProcessor.timeSeries.harmonicRegression(collection, {
+    indexName: 'NDVI',
+    minObservations: 10
+  });
+
+  var ndreModel = SatelliteProcessor.timeSeries.harmonicRegression(collection, {
+    indexName: 'NDRE',
+    minObservations: 10
+  });
+
+  var monitoringComposite = ndviModel.addBands(ndreModel);
+
+  Map.addLayer(
+    monitoringComposite.select('NDVI_trend'),
+    {min: -0.03, max: 0.03, palette: ['red', 'white', 'green']},
+    'NDVI Trend'
+  );
+
+  Map.addLayer(
+    monitoringComposite.select('NDRE_amplitude'),
+    {min: 0, max: 0.3, palette: ['black', 'orange', 'yellow']},
+    'NDRE Seasonality'
+  );
+
+  return monitoringComposite;
+}

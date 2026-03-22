@@ -365,3 +365,37 @@ var stats = pixelCount.reduceRegion({
   maxPixels: 1e13
 });
 print('Статистика валидных пикселей:', stats);
+
+/////////////////////////////////////
+// ПРИМЕР 7: Гармонический анализ тренда и сезонности (state-of-the-art)
+/////////////////////////////////////
+var harmonicCollection = SatelliteProcessor.getCleanCollection(
+  SatelliteProcessor.SENTINEL2,
+  roi,
+  '2021-01-01',
+  '2024-12-31',
+  {
+    months: [4, 10],
+    indices: ['NDVI']
+  }
+);
+
+var harmonicSummary = SatelliteProcessor.timeSeries.harmonicRegression(
+  harmonicCollection,
+  {
+    indexName: 'NDVI',
+    minObservations: 8
+  }
+);
+
+Map.addLayer(
+  harmonicSummary.select('NDVI_trend'),
+  {min: -0.05, max: 0.05, palette: ['red', 'white', 'green']},
+  'NDVI Harmonic Trend'
+);
+
+Map.addLayer(
+  harmonicSummary.select('NDVI_peakDOY'),
+  {min: 90, max: 280, palette: ['purple', 'cyan', 'yellow']},
+  'NDVI Peak DOY'
+);
